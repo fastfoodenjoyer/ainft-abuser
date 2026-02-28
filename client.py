@@ -1,8 +1,8 @@
 import json
 from typing import Any, Generator
 
-from curl_cffi import Session
-
+from curl_cffi.requests import Session
+from curl_cffi.requests.exceptions import RequestException, Timeout, ProxyError, CurlError
 
 class AinftClient:
     """
@@ -21,11 +21,51 @@ class AinftClient:
         "llama": "meta"
     }
 
-    def __init__(self, api_key: str, proxy: str = None):
+    def __init__(self, api_key: str, proxies: list[str] | str | None = None):
         self.api_key = api_key
+        
+        if isinstance(proxies, str):
+            self.proxies = [proxies]
+        elif proxies and isinstance(proxies, list):
+            self.proxies = proxies
+        else:
+            self.proxies = [None]
+            
+        self.proxy_index = 0
+        self._init_session()
+
+    def _init_session(self):
         self.session = Session(impersonate="chrome")
+        proxy = self.proxies[self.proxy_index]
         if proxy:
+            if "://" not in proxy:
+                proxy = f"http://{proxy}"
             self.session.proxies = {"http": proxy, "https": proxy}
+
+    def _rotate_proxy(self):
+        if len(self.proxies) > 1:
+            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+            print(f"[AinftClient] Switching to next proxy: {self.proxies[self.proxy_index]}")
+            self._init_session()
+        elif self.proxies[0] is not None:
+            print(f"[AinftClient] Reconnecting with the same proxy...")
+            self._init_session()
+
+    def _request(self, method: str, url: str, max_retries: int = None, **kwargs):
+        if max_retries is None:
+            max_retries = max(3, len(self.proxies))
+            
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                return response
+            except (RequestException, Timeout, ProxyError, CurlError, Exception) as e:
+                last_exc = e
+                print(f"[AinftClient] Network error on attempt {attempt + 1}: {type(e).__name__}: {str(e)}")
+                self._rotate_proxy()
+                
+        raise Exception(f"Request failed after {max_retries} attempts. Last error: {last_exc}")
 
     def _get_provider_for_model(self, model: str) -> str:
         model_lower = model.lower()
@@ -77,7 +117,7 @@ class AinftClient:
         # The API seems to inherently use SSE even for stream=True payloads,
         # but if stream=False is supported, it might return a full JSON.
         # Let's handle both.
-        response = self.session.post(url, json=payload, headers=headers)
+        response = self._request("POST", url, json=payload, headers=headers)
         if response.status_code != 200:
             raise Exception(f"API Error {response.status_code}: {response.text}")
 
@@ -112,7 +152,7 @@ class AinftClient:
 
     def _stream_response(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> Generator[
         str, None, None]:
-        response = self.session.post(url, json=payload, headers=headers, stream=True)
+        response = self._request("POST", url, json=payload, headers=headers, stream=True)
         if response.status_code != 200:
             error_text = response.content.decode('utf-8', errors='ignore')
             raise Exception(f"API Error {response.status_code}: {error_text}")

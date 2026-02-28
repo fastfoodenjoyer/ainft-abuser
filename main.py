@@ -8,7 +8,8 @@ import sys
 import argparse
 from datetime import datetime, timedelta, timezone
 
-from curl_cffi import requests
+from curl_cffi.requests import Session
+from curl_cffi.requests.exceptions import RequestException, Timeout, ProxyError, CurlError
 
 from eth_account import Account
 from eth_keys import keys
@@ -92,13 +93,58 @@ def generate_ainft_auth(user_id):
     return base64.b64encode(result).decode('utf-8')
 
 class AinftBot:
-    def __init__(self, proxy=None):
-        self.session = requests.Session(impersonate="chrome")
-        if proxy:
-            self.session.proxies = {"http": proxy, "https": proxy}
+    def __init__(self, proxies: list[str] | str | None = None, start_index: int = 0):
+        if isinstance(proxies, str):
+            self.proxies = [proxies]
+        elif proxies and isinstance(proxies, list):
+            self.proxies = proxies
+        else:
+            self.proxies = [None]
             
+        self.proxy_index = start_index % len(self.proxies) if self.proxies[0] is not None else 0
+        self._init_session()
+        
         self.priv, self.address, self.mnemonic = generate_wallet()
         print(f"Generated Wallet: {self.address}")
+        
+    def _init_session(self):
+        # Choose a random browser impersonation to avoid fixed JA3/HTTP2 fingerprints
+        browsers = ["chrome", "chrome110", "edge99", "safari15_3", "safari15_5", "chrome116", "chrome120"]
+        browser = random.choice(browsers)
+        
+        self.session = Session(impersonate=browser)
+        self.session.cookies.clear() # clear any cookies just in case
+        
+        proxy = self.proxies[self.proxy_index]
+        if proxy:
+            if "://" not in proxy:
+                proxy = f"http://{proxy}"
+            self.session.proxies = {"http": proxy, "https": proxy}
+
+    def _rotate_proxy(self):
+        if len(self.proxies) > 1:
+            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+            print(f"[AinftBot] Switching to next proxy: {self.proxies[self.proxy_index]}")
+            self._init_session()
+        elif self.proxies[0] is not None:
+            print(f"[AinftBot] Reconnecting with the same proxy...")
+            self._init_session()
+
+    def _request(self, method: str, url: str, max_retries: int = None, **kwargs):
+        if max_retries is None:
+            max_retries = max(3, len(self.proxies))
+            
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                return response
+            except (RequestException, Timeout, ProxyError, CurlError, Exception) as e:
+                last_exc = e
+                print(f"[AinftBot] Network error on attempt {attempt + 1} ({url}): {type(e).__name__}: {str(e)}")
+                self._rotate_proxy()
+                
+        raise Exception(f"Request {method} {url} failed after {max_retries} attempts. Last error: {last_exc}")
         
     def get_csrf(self):
         url = 'https://chat.ainft.com/api/auth/csrf'
@@ -107,7 +153,7 @@ class AinftBot:
             'content-type': 'application/json',
             'referer': 'https://chat.ainft.com/purchase',
         }
-        resp = self.session.get(url, headers=headers)
+        resp = self._request("GET", url, headers=headers)
         if resp.status_code != 200:
             print(f"CRSF Error {resp.status_code}: {resp.text}")
         return resp.json().get('csrfToken')
@@ -147,7 +193,7 @@ class AinftBot:
             'x-auth-return-redirect': '1'
         }
         
-        resp = self.session.post(url, data=data, headers=headers)
+        resp = self._request("POST", url, data=data, headers=headers)
         print(f"Callback Status: {resp.status_code}")
         try:
             print("Callback JSON:", resp.json())
@@ -155,7 +201,7 @@ class AinftBot:
             print("Callback TEXT:", resp.text)
         
         session_url = 'https://chat.ainft.com/api/auth/session'
-        resp_session = self.session.get(session_url, headers={'accept': 'application/json'})
+        resp_session = self._request("GET", session_url, headers={'accept': 'application/json'})
         print(f"Session Status: {resp_session.status_code}")
         try:
             js = resp_session.json()
@@ -206,7 +252,7 @@ class AinftBot:
         }
         
         url = 'https://chat.ainft.com/trpc/lambda/user.claimSignupBonus?batch=1'
-        resp = self.session.post(url, json=payload, headers=headers)
+        resp = self._request("POST", url, json=payload, headers=headers)
         print("Claim response:", resp.text)
         return resp.json()
 
@@ -229,7 +275,7 @@ class AinftBot:
         }
         
         url = 'https://chat.ainft.com/trpc/lambda/apiKey.createApiKey?batch=1'
-        resp = self.session.post(url, json=payload, headers=headers)
+        resp = self._request("POST", url, json=payload, headers=headers)
         
         try:
             data = resp.json()
@@ -281,11 +327,13 @@ if __name__ == "__main__":
                 proxy = f"http://{proxy}"
             print(f"Using proxy: {proxy}")
             
-        bot = AinftBot(proxy=proxy)
+        bot = AinftBot(proxies=proxies, start_index=i)
         if bot.login():
             bot.claim_credits()
             api_key = bot.create_api_key()
             bot.save_account(api_key=api_key)
         
         if i < args.iterations - 1:
-            time.sleep(1) # simple delay between iterations
+            delay = 15
+            print(f"Waiting {delay} seconds for proxy rotation / rate limits...")
+            time.sleep(delay)
