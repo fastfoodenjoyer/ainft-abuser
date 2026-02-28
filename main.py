@@ -108,11 +108,7 @@ class AinftBot:
         print(f"Generated Wallet: {self.address}")
         
     def _init_session(self):
-        # Choose a random browser impersonation to avoid fixed JA3/HTTP2 fingerprints
-        browsers = ["chrome", "chrome110", "edge99", "safari15_3", "safari15_5", "chrome116", "chrome120"]
-        browser = random.choice(browsers)
-        
-        self.session = Session(impersonate=browser)
+        self.session = Session(impersonate=["chrome"])
         self.session.cookies.clear() # clear any cookies just in case
         
         proxy = self.proxies[self.proxy_index]
