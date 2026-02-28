@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+.env
+*.txt
+*.xlsx
+.DS_Store
+full_bundles/
+node_modules/
+*.js
+*.json
+.idea/
