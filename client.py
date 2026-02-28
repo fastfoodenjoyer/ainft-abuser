@@ -1,0 +1,171 @@
+import json
+from typing import Any, Generator
+
+from curl_cffi import Session
+
+
+class AinftClient:
+    """
+    Client for interacting with chat.ainft.com models using generated API keys.
+    """
+    BASE_URL = "https://chat.ainft.com/webapi/chat"
+
+    # Map common model prefixes to their providers
+    PROVIDER_MAP = {
+        "gpt": "openai",
+        "o1": "openai",
+        "o3": "openai",
+        "claude": "anthropic",
+        "gemini": "google",
+        "deepseek": "deepseek",
+        "llama": "meta"
+    }
+
+    def __init__(self, api_key: str, proxy: str = None):
+        self.api_key = api_key
+        self.session = Session(impersonate="chrome")
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+
+    def _get_provider_for_model(self, model: str) -> str:
+        model_lower = model.lower()
+        for prefix, provider in self.PROVIDER_MAP.items():
+            if model_lower.startswith(prefix):
+                return provider
+        # Default fallback
+        return "openai"
+
+    def chat_completions(
+            self,
+            messages: list[dict[str, str]],
+            model: str = "gpt-5-mini",
+            stream: bool = False,
+            temperature: float = 1.0,
+            top_p: float = 1.0,
+            frequency_penalty: float = 0.0,
+            presence_penalty: float = 0.0
+    ):
+        """
+        Sends a chat completion request to the given model.
+        Returns a string if stream=False, or a generator yielding text chunks if stream=True.
+        """
+        provider = self._get_provider_for_model(model)
+        url = f"{self.BASE_URL}/{provider}"
+
+        headers = {
+            'accept': 'application/json' if not stream else 'text/event-stream',
+            'authorization': f'Bearer {self.api_key}',
+            'content-type': 'application/json'
+        }
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty
+        }
+
+        if stream:
+            return self._stream_response(url, headers, payload)
+        else:
+            return self._sync_response(url, headers, payload)
+
+    def _sync_response(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> str:
+        # The API seems to inherently use SSE even for stream=True payloads,
+        # but if stream=False is supported, it might return a full JSON.
+        # Let's handle both.
+        response = self.session.post(url, json=payload, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"API Error {response.status_code}: {response.text}")
+
+        try:
+            # Try to parse as normal JSON if stream=False actually works
+            data = response.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            elif "message" in data:
+                return data["message"]["content"]
+        except Exception:
+            pass
+
+        # Default fallback to stream parser if simple json fails
+        full_text = ""
+        for line in response.text.splitlines():
+            if line.startswith("data: "):
+                data_str = line[6:].strip()
+                if data_str == '"STOP"' or data_str == '[DONE]':
+                    break
+
+                if data_str.startswith("{"):
+                    pass
+                elif data_str.startswith('"') and data_str.endswith('"'):
+                    try:
+                        chunk = json.loads(data_str)
+                        if chunk.lower() != "stop":
+                            full_text += chunk
+                    except:
+                        pass
+        return full_text.strip()
+
+    def _stream_response(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> Generator[
+        str, None, None]:
+        response = self.session.post(url, json=payload, headers=headers, stream=True)
+        if response.status_code != 200:
+            error_text = response.content.decode('utf-8', errors='ignore')
+            raise Exception(f"API Error {response.status_code}: {error_text}")
+
+        for line_bytes in response.iter_lines():
+            if not line_bytes:
+                continue
+            line = line_bytes.decode('utf-8')
+            if line.startswith("data: "):
+                data_str = line[6:].strip()
+                if data_str == '"STOP"' or data_str == '[DONE]':
+                    break
+
+                # Check for usage/speed JSON stats or empty dicts
+                if data_str.startswith("{"):
+                    pass
+                elif data_str.startswith('"') and data_str.endswith('"'):
+                    try:
+                        chunk = json.loads(data_str)
+                        if chunk.lower() != "stop":
+                            yield chunk
+                    except:
+                        pass
+                    # Sometimes it's a JSON block with usage stats
+                    try:
+                        obj = json.loads(data_str)
+                        if "choices" in obj:
+                            delta = obj["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                yield delta["content"]
+                    except:
+                        pass
+
+
+if __name__ == "__main__":
+    # Test execution
+    # Replace with a valid API key from accounts.xlsx
+    TEST_API_KEY = "sk-asdf..."
+    text = "Tell me a story about a robot learning to love."
+    stream = True
+    model = "gemini-3-flash-preview"
+
+    client = AinftClient(api_key=TEST_API_KEY)
+
+    print(f"Testing {model} (Stream={stream})...")
+    print(f"Input: {text}")
+    messages = [{"role": "user", "content": text}]
+    print("Answer:")
+    if stream:
+        for chunk in client.chat_completions(messages=messages, model=model, stream=stream):
+            print(chunk, end="", flush=True)
+    else:
+        response = client.chat_completions(messages=messages, model=model, stream=stream)
+        print(response)
+
+    print("\n\nDone!")
